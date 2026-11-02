@@ -1,0 +1,100 @@
+# dgist-6g: NVIDIA Aerial L1 (cuphycontroller) with the in-process YOLO dApp + xApp agent, on one GH200.
+#
+#   docker compose up -d                          demo mode: L1 + dApp only (Benetel RU, OAI gNB/MAC and the core run outside, see README)
+#   docker compose --profile loopback up -d       loopback mode: + RU emulator (traffic generator) + testMAC, no radio needed
+#   docker compose --profile xapp up -d           + the two xApp stand-ins (Resource Allocator, Network Slicing) against the agent
+#   docker compose --profile tools run --rm build     apply the patch set to the SDK checkout and build the binaries (first time, ~1 h)
+#   docker compose --profile tools run --rm engines   build the TensorRT engines (after scripts/export_models.sh)
+#
+# Everything reads .env. The SDK checkout (AERIAL_SDK_DIR) is mounted at /opt/nvidia/cuBB in every container, this repository at
+# /opt/dgist-6g, and the containers coordinate through the shared volume dgist-run (/run/dgist: markers + logs).
+name: dgist-6g
+
+x-aerial: &aerial
+  image: ${AERIAL_IMAGE:-nvcr.io/nvidia/aerial/aerial-cuda-accelerated-ran:25-3-cubb}
+  network_mode: host
+  privileged: true
+  ipc: host
+  userns_mode: host
+  shm_size: 4096m
+  ulimits:
+    memlock: -1
+  user: root
+  stdin_open: true
+  tty: true
+  env_file: .env
+  environment:
+    - cuBB_SDK=/opt/nvidia/cuBB
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=all
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  devices:
+    - /dev/gdrdrv:/dev/gdrdrv
+  volumes:
+    - ${AERIAL_SDK_DIR}:/opt/nvidia/cuBB
+    - ./:/opt/dgist-6g
+    - dgist-run:/run/dgist
+    - /dev/hugepages:/dev/hugepages
+    - /lib/modules:/lib/modules
+    - /usr/src:/usr/src
+    - /var/log/aerial:/var/log/aerial
+    - /var/lock:/var/lock
+    - /run/systemd/system:/run/systemd/system
+    - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
+
+services:
+  aerial-l1:
+    <<: *aerial
+    container_name: nv-cubb          # the name the OAI gNB compose file expects for ipc: container:nv-cubb
+    command: ["bash", "/opt/dgist-6g/scripts/l1_entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /run/dgist/tenant_ready"]
+      interval: 20s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  ru-emulator:
+    <<: *aerial
+    profiles: ["loopback"]
+    container_name: dgist-ru-emulator
+    command: ["bash", "/opt/dgist-6g/scripts/ru_entrypoint.sh"]
+
+  testmac:
+    <<: *aerial
+    profiles: ["loopback"]
+    container_name: dgist-testmac
+    command: ["bash", "/opt/dgist-6g/scripts/testmac_entrypoint.sh"]
+
+  ra-stub:
+    <<: *aerial
+    profiles: ["xapp"]
+    container_name: dgist-ra-stub
+    command: ["bash", "-c", "until test -f /run/dgist/tenant_ready; do sleep 2; done; exec python3 /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/python/ra_stub.py --host 127.0.0.1 --port ${DAPP_AGENT_PORT:-9810} --images ${RA_IMAGES:-/opt/nvidia/cuBB/cuPHY-CP/dapp_hook/models/img4k} --rate ${RA_RATE:-4} --duration ${RA_DURATION:-600} --policy ${RA_POLICY:-map} --deadline-ms ${RA_DEADLINE_MS:-36} --csv /run/dgist/ra_stub.csv"]
+
+  slicing-stub:
+    <<: *aerial
+    profiles: ["xapp"]
+    container_name: dgist-slicing-stub
+    command: ["bash", "-c", "until test -f /run/dgist/tenant_ready; do sleep 2; done; exec python3 /opt/nvidia/cuBB/cuPHY-CP/dapp_hook/python/slicing_stub.py --host 127.0.0.1 --port ${DAPP_AGENT_PORT:-9810} --period-ms ${SLICING_PERIOD_MS:-1000} --csv /run/dgist/slicing_stub.csv"]
+
+  build:
+    <<: *aerial
+    profiles: ["tools"]
+    container_name: dgist-build
+    command: ["bash", "/opt/dgist-6g/scripts/build.sh"]
+
+  engines:
+    <<: *aerial
+    profiles: ["tools"]
+    container_name: dgist-engines
+    command: ["bash", "/opt/dgist-6g/scripts/engines.sh"]
+
+volumes:
+  dgist-run:
